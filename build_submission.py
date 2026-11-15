@@ -204,6 +204,26 @@ def resort_level(train, target, pred):
     return out
 
 
+def gabala_novruz(train, target, pred):
+    """Novruzun axini hefte gunu deyil, kecen illerin eyni tarixi dasiyir."""
+    out = np.asarray(pred, dtype=float).copy()
+    hist = train[train["train_n"].isin([709, 710])].copy()
+    hist["md"] = hist["trip_date"].dt.strftime("%m-%d")
+    level = hist.groupby(["train_n", "md"])["occupancy"].mean()
+    md = target["trip_date"].dt.strftime("%m-%d")
+    use = target["train_n"].isin([709, 710]) & md.between("03-20", "03-27")
+    if not use.any():
+        return out
+    table = target.loc[use, ["train_n"]].copy()
+    table["md"] = md[use].to_numpy()
+    table = table.merge(level.rename("flow").reset_index(), on=["train_n", "md"], how="left")
+    values = table["flow"].to_numpy(dtype=float)
+    slot = np.flatnonzero(use.to_numpy())
+    good = ~np.isnan(values)
+    out[slot[good]] = np.clip(values[good], 0, 2.5)
+    return out
+
+
 def evaluate(train, month_strength, adjust_trains):
     windows = [
         ("jul-oct 2025", "2025-07-01", "2025-11-01"),
@@ -274,6 +294,7 @@ def main():
     base = predict_from_history(train, test, strength, trains)
     pred = pd.Series(same_month_level(train, test, base, cell_strength), index=test.index)
     pred = pd.Series(resort_level(train, test, pred), index=test.index)
+    pred = pd.Series(gabala_novruz(train, test, pred), index=test.index)
     public = test["trip_date"] < "2026-04-16"
     for label, mask in [
         ("main", test["train_n"].isin(MAIN_TRAINS)),
