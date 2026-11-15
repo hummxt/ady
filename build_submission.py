@@ -131,6 +131,78 @@ def load_frames():
     return train, test
 
 
+def same_month_level(history, target, base, strength):
+    """Eyni ay ve hefte gununun kecmis dolulugunu esas proqnoza qatisdirir."""
+    cell = (
+        history.groupby(["seg", "month", "dow"])["occupancy"]
+        .agg(past_mean="mean", past_n="count")
+        .reset_index()
+    )
+    table = target[["seg", "month", "dow"]].reset_index(drop=True)
+    table = table.merge(cell, on=["seg", "month", "dow"], how="left")
+    past = table["past_mean"].to_numpy(dtype=float)
+    count = table["past_n"].fillna(0).to_numpy(dtype=float)
+    base = np.asarray(base, dtype=float)
+    mixed = (count * np.where(np.isnan(past), base, past) + strength * base) / (count + strength)
+    return np.clip(mixed, 0, 2.5)
+
+
+def window_score(train, origin, end, month_strength, adjust_trains, cell_strength):
+    history = train[train["trip_date"] < origin]
+    future = train[(train["trip_date"] >= origin) & (train["trip_date"] < end)].copy()
+    base = predict_from_history(history, future, month_strength, adjust_trains)
+    pred = pd.Series(same_month_level(history, future, base, cell_strength), index=future.index)
+    return weighted_rmse(future["occupancy"], pred, future["n_segments"]), future, pred
+
+
+def resort_level(train, target, pred):
+    """27/28 ucun son sakit rejimi, 709/710 ucun kecen ilin eyni ayini goturur."""
+    out = np.asarray(pred, dtype=float).copy()
+    calm_start = pd.Timestamp("2026-02-15")
+    calm = train[(train["train_n"].isin([27, 28])) & (train["trip_date"] >= calm_start)]
+    if len(calm):
+        by_seg = calm.groupby(["seg", "dow"])["occupancy"].mean().rename("seg_calm").reset_index()
+        by_dow = calm.groupby("dow")["occupancy"].mean()
+        gabala_2024 = train[(train["train_n"].isin([709, 710])) & (train["trip_date"].dt.year == 2024)]
+        month_mean = gabala_2024.groupby("month")["occupancy"].mean()
+        february = float(month_mean.loc[2]) if 2 in month_mean.index else np.nan
+        month_factor = (month_mean / february) if february and february > 0 else None
+
+        table = target[["seg", "dow", "month"]].reset_index(drop=True)
+        table = table.merge(by_seg, on=["seg", "dow"], how="left")
+        level = table["seg_calm"].to_numpy(dtype=float)
+        fallback = table["dow"].map(by_dow).to_numpy(dtype=float)
+        level = np.where(np.isnan(level), fallback, level)
+        if month_factor is not None:
+            factor = table["month"].map(month_factor).fillna(1.0).to_numpy(dtype=float)
+            # Fevralin sonu artiq sakitdir, marti bir daha endirmirik.
+            factor = np.where(table["month"].to_numpy() == 3, 1.0, factor)
+            level = level * factor
+
+        holiday_window = pd.date_range("2026-03-20", "2026-03-27")
+        is_break = (
+            target["trip_date"].isin(holiday_window) | target["trip_date"].isin(HOLIDAYS)
+        ).to_numpy()
+        weekend = target["dow"].isin([5, 6]).to_numpy()
+        level = np.where(is_break & weekend, 0.85, level)
+        level = np.where(is_break & ~weekend, np.maximum(np.nan_to_num(level, nan=0.18), 0.18), level)
+
+        is_new = target["train_n"].isin([27, 28]).to_numpy()
+        use = is_new & ~np.isnan(level)
+        out[use] = np.clip(level[use], 0, 1.6)
+
+    gabala_2025 = train[(train["train_n"].isin([709, 710])) & (train["trip_date"].dt.year == 2025)]
+    if len(gabala_2025):
+        cell = gabala_2025.groupby(["seg", "month", "dow"])["occupancy"].mean()
+        table = target[["seg", "month", "dow"]].reset_index(drop=True)
+        table = table.merge(cell.rename("season").reset_index(), on=["seg", "month", "dow"], how="left")
+        season = table["season"].to_numpy(dtype=float)
+        is_gabala = target["train_n"].isin([709, 710]).to_numpy()
+        use = is_gabala & ~np.isnan(season)
+        out[use] = np.clip(0.85 * season[use] + 0.15 * out[use], 0, 2.5)
+    return out
+
+
 def evaluate(train, month_strength, adjust_trains):
     windows = [
         ("jul-oct 2025", "2025-07-01", "2025-11-01"),
@@ -175,8 +247,40 @@ def main():
             best = (choice, strength, trains, name)
 
     strength, trains, name = best[1], best[2], best[3]
-    print(f"\nusing month strength {strength}, adjust {name}")
-    pred = predict_from_history(train, test, strength, trains)
+    print(f"\nmonth model: strength {strength}, adjust {name}")
+
+    cell_options = [2, 4, 8, 20]
+    periods = [
+        ("public-like", "2025-03-01", "2025-04-16"),
+        ("private-like", "2025-04-16", "2025-07-01"),
+        ("feb 2026", "2026-02-01", "2026-03-01"),
+    ]
+    best_cell = None
+    for cell_strength in cell_options:
+        print(f"\ncell strength {cell_strength}")
+        scores = {}
+        for label, origin, end in periods:
+            value, future, pred = window_score(train, origin, end, strength, trains, cell_strength)
+            scores[label] = value
+            print(f"  {label}: {value:.4f}  {group_scores(future, pred)}")
+        choice = 0.55 * scores["public-like"] + 0.25 * scores["private-like"] + 0.20 * scores["feb 2026"]
+        print(f"  choice {choice:.4f}")
+        if best_cell is None or choice < best_cell[0]:
+            best_cell = (choice, cell_strength)
+
+    cell_strength = best_cell[1]
+    print(f"\nusing cell strength {cell_strength}")
+    base = predict_from_history(train, test, strength, trains)
+    pred = pd.Series(same_month_level(train, test, base, cell_strength), index=test.index)
+    pred = pd.Series(resort_level(train, test, pred), index=test.index)
+    public = test["trip_date"] < "2026-04-16"
+    for label, mask in [
+        ("main", test["train_n"].isin(MAIN_TRAINS)),
+        ("gabala", test["train_n"].isin([709, 710])),
+        ("new", test["train_n"].isin([27, 28])),
+    ]:
+        part = pred[public & mask]
+        print(f"public {label} mean {part.mean():.3f}")
 
     sample = pd.read_csv(DATA / "sample_submission.csv")
     submission = sample[["id"]].copy()
