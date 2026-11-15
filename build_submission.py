@@ -184,7 +184,8 @@ def resort_level(train, target, pred):
             target["trip_date"].isin(holiday_window) | target["trip_date"].isin(HOLIDAYS)
         ).to_numpy()
         weekend = target["dow"].isin([5, 6]).to_numpy()
-        level = np.where(is_break & weekend, 0.85, level)
+        pooled = table["dow"].map(by_dow).to_numpy(dtype=float)
+        level = np.where(is_break & weekend, pooled * 2.0, level)
         level = np.where(is_break & ~weekend, np.maximum(np.nan_to_num(level, nan=0.18), 0.18), level)
 
         is_new = target["train_n"].isin([27, 28]).to_numpy()
