@@ -155,7 +155,7 @@ def window_score(train, origin, end, month_strength, adjust_trains, cell_strengt
     return weighted_rmse(future["occupancy"], pred, future["n_segments"]), future, pred
 
 
-def resort_level(train, target, pred):
+def resort_level(train, target, pred, gabala_weight=0.85):
     """27/28 ucun son sakit rejimi, 709/710 ucun kecen ilin eyni ayini goturur."""
     out = np.asarray(pred, dtype=float).copy()
     calm_start = pd.Timestamp("2026-02-15")
@@ -180,13 +180,16 @@ def resort_level(train, target, pred):
             level = level * factor
 
         holiday_window = pd.date_range("2026-03-20", "2026-03-27")
+        extra_rest = pd.to_datetime(["2026-03-09", "2026-03-30", "2026-05-11", "2026-05-29"])
         is_break = (
             target["trip_date"].isin(holiday_window) | target["trip_date"].isin(HOLIDAYS)
         ).to_numpy()
+        is_extra = target["trip_date"].isin(extra_rest).to_numpy()
         weekend = target["dow"].isin([5, 6]).to_numpy()
         pooled = table["dow"].map(by_dow).to_numpy(dtype=float)
         level = np.where(is_break & weekend, pooled * 1.6, level)
         level = np.where(is_break & ~weekend, np.maximum(np.nan_to_num(level, nan=0.18), 0.18), level)
+        level = np.where(is_extra, np.maximum(np.nan_to_num(level, nan=0.18), 0.18), level)
 
         is_new = target["train_n"].isin([27, 28]).to_numpy()
         use = is_new & ~np.isnan(level)
@@ -200,7 +203,8 @@ def resort_level(train, target, pred):
         season = table["season"].to_numpy(dtype=float)
         is_gabala = target["train_n"].isin([709, 710]).to_numpy()
         use = is_gabala & ~np.isnan(season)
-        out[use] = np.clip(0.85 * season[use] + 0.15 * out[use], 0, 2.5)
+        if gabala_weight > 0:
+            out[use] = np.clip((1.0 - gabala_weight) * out[use] + gabala_weight * season[use], 0, 2.5)
     return out
 
 
@@ -306,6 +310,77 @@ def gabala_novruz(train, target, pred):
     return out
 
 
+STEADY_BREAK = pd.to_datetime(
+    [
+        "2025-03-24", "2025-03-25", "2025-03-26", "2025-03-27", "2025-03-28", "2025-03-31",
+        "2026-03-23", "2026-03-24", "2026-03-25", "2026-03-26", "2026-03-27", "2026-03-30",
+    ]
+)
+
+
+def morning_break(history, target, pred):
+    out = pd.Series(np.asarray(pred, dtype=float), index=target.index).copy()
+    mask = target["train_n"].eq(733) & target["trip_date"].isin(STEADY_BREAK)
+    if not mask.any():
+        return out.to_numpy()
+    weekends = history[(history["train_n"] == 733) & history["dow"].isin([5, 6])]
+    departures = set(target.loc[mask, "departure_time"].unique())
+    matched = weekends[weekends["departure_time"].isin(departures)]
+    source = matched if len(matched) >= 200 else weekends
+    level = source.groupby("seg")["occupancy"].mean()
+    values = target.loc[mask, "seg"].map(level).to_numpy(dtype=float)
+    positions = np.flatnonzero(mask.to_numpy())
+    good = ~np.isnan(values)
+    out.iloc[positions[good]] = np.clip(values[good], 0, 2.5)
+    return out.to_numpy()
+
+
+def stack(history, target, gabala_weight):
+    base = predict_from_history(history, target, 4, MAIN_TRAINS)
+    level = same_month_level(history, target, base, 2)
+    pre = np.asarray(resort_level(history, target, level, gabala_weight), dtype=float)
+    pred = gabala_march_single(history, target, pre)
+    pred = gabala_novruz(history, target, pred)
+    pred = gabala_tail(history, target, pred)
+    pred = np.asarray(morning_break(history, target, pred), dtype=float)
+    return pre, pred
+
+
+def pull_lower_last_year(history, target, pred, weight=0.5):
+    pred = np.asarray(pred, dtype=float).copy()
+    hist = history.loc[
+        history["train_n"].isin([709, 710]),
+        ["train_n", "seg", "month", "dow", "trip_date", "occupancy"],
+    ].copy()
+    if hist.empty:
+        return pred
+    hist["year"] = hist["trip_date"].dt.year
+    level = hist.groupby(["train_n", "seg", "month", "dow", "year"])["occupancy"].mean()
+    table = pd.DataFrame(
+        {
+            "train_n": target["train_n"].to_numpy(),
+            "seg": target["seg"].to_numpy(),
+            "month": target["month"].to_numpy(),
+            "dow": target["dow"].to_numpy(),
+            "year": target["trip_date"].dt.year.to_numpy() - 1,
+        }
+    )
+    merged = table.merge(level.rename("ly").reset_index(), on=["train_n", "seg", "month", "dow", "year"], how="left")
+    ly = merged["ly"].to_numpy(dtype=float)
+    use = target["train_n"].isin([709, 710]).to_numpy() & ~np.isnan(ly) & (ly < pred)
+    pred[use] = (1.0 - weight) * pred[use] + weight * ly[use]
+    return np.clip(pred, 0, 2.5)
+
+
+def forecast(history, target):
+    pre, hand = stack(history, target, 0.0)
+    _, kept = stack(history, target, 0.85)
+    pinned = np.abs(hand - pre) > 1e-8
+    out = hand.copy()
+    out[pinned] = kept[pinned]
+    return pull_lower_last_year(history, target, out, 0.5)
+
+
 def evaluate(train, month_strength, adjust_trains):
     windows = [
         ("jul-oct 2025", "2025-07-01", "2025-11-01"),
@@ -373,12 +448,7 @@ def main():
 
     cell_strength = best_cell[1]
     print(f"\nusing cell strength {cell_strength}")
-    base = predict_from_history(train, test, strength, trains)
-    pred = pd.Series(same_month_level(train, test, base, cell_strength), index=test.index)
-    pred = pd.Series(resort_level(train, test, pred), index=test.index)
-    pred = pd.Series(gabala_march_single(train, test, pred), index=test.index)
-    pred = pd.Series(gabala_novruz(train, test, pred), index=test.index)
-    pred = pd.Series(gabala_tail(train, test, pred), index=test.index)
+    pred = pd.Series(forecast(train, test), index=test.index)
     public = test["trip_date"] < "2026-04-16"
     for label, mask in [
         ("main", test["train_n"].isin(MAIN_TRAINS)),
